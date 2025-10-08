@@ -9,7 +9,7 @@
 
 // =================== Аппаратные пины (жёстко) ===================
 // NodeMCU v2: D1=GPIO5, D2=GPIO4
-const uint8_t PIN_SENSOR = D1;     // вход от датчика уровня (HIGH = бак ПОЛНЫЙ)
+const uint8_t PIN_SENSOR = D1;     // вход от датчика уровня (LOW = бак ПОЛНЫЙ)
 const uint8_t PIN_RELAY  = D2;     // выход на реле насоса (HIGH = включить насос)
 const uint8_t LED_PIN    = LED_BUILTIN; // встроенный LED (на ESP8266 активен по LOW)
 
@@ -308,7 +308,7 @@ void setRelay(bool on) {
 
 bool readSensorRaw() {
   // Сигнал с датчика: HIGH = бак ПОЛНЫЙ
-  return digitalRead(PIN_SENSOR) == HIGH;
+  return digitalRead(PIN_SENSOR) == LOW;
 }
 
 // =================== SETUP ===================
@@ -332,7 +332,7 @@ void setup() {
   LittleFS.begin(); loadConfig();
 
   // Пины датчика и реле
-  pinMode(PIN_SENSOR, INPUT);      // датчик — вход (внешний источник уровня)
+  pinMode(PIN_SENSOR, INPUT_PULLUP); // датчик — вход (внешний источник уровня)
   pinMode(PIN_RELAY,  OUTPUT);     // реле — выход
   setRelay(false);                 // по умолчанию насос выкл
 
