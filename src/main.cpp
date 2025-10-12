@@ -8,10 +8,11 @@
 #include <ESP8266mDNS.h>
 
 // =================== Аппаратные пины (жёстко) ===================
-// NodeMCU v2: D1=GPIO5, D2=GPIO4
-const uint8_t PIN_SENSOR = D1;     // вход от датчика уровня (LOW = бак ПОЛНЫЙ)
-const uint8_t PIN_RELAY  = D2;     // выход на реле насоса (HIGH = включить насос)
-const uint8_t LED_PIN    = LED_BUILTIN; // встроенный LED (на ESP8266 активен по LOW)
+// NodeMCU v2: D1=GPIO5 (100%), D2=GPIO4 (реле), D5=GPIO14 (50%)
+const uint8_t PIN_SENSOR100 = D1;     // датчик 100% (HIGH = бак ПОЛНЫЙ)
+const uint8_t PIN_SENSOR50  = D5;     // датчик  50% (HIGH = бак >= ~50%)
+const uint8_t PIN_RELAY     = D2;     // выход на реле насоса (HIGH = включить насос)
+const uint8_t LED_PIN       = LED_BUILTIN; // встроенный LED (активен по LOW)
 
 const int FACTORY_PIN = D7;                 // GPIO13 — держать LOW ~5 c при старте для сброса
 const unsigned long FACTORY_HOLD_MS = 5000;
@@ -88,47 +89,65 @@ WiFiClient   espClient;
 PubSubClient mqtt(espClient);
 bool         mqtt_online = false;
 
+// Топики
 String topicBase()          { return String(cfg.base_topic); }
-String topicAvail()         { return topicBase() + "/status"; }        // online/offline
-String topicSensorState()   { return topicBase() + "/sensor/state"; }  // ON (full) / OFF (not full)
-String topicRelayState()    { return topicBase() + "/relay/state"; }   // ON / OFF
-String topicRelaySet()      { return topicBase() + "/relay/set"; }     // ON / OFF
-String topicModeState()     { return topicBase() + "/mode/state"; }    // "auto" / "external"
-String topicModeSet()       { return topicBase() + "/mode/set"; }      // "auto" / "external"
-String topicAttr()          { return topicBase() + "/attributes"; }    // JSON телеметрия
+String topicAvail()         { return topicBase() + "/status"; }          // online/offline
+String topicLevelState()    { return topicBase() + "/level/state"; }     // 0 / 50 / 100
+String topicErrorState()    { return topicBase() + "/error/state"; }     // ON / OFF (расхождение)
+String topicRelayState()    { return topicBase() + "/relay/state"; }     // ON / OFF
+String topicRelaySet()      { return topicBase() + "/relay/set"; }       // ON / OFF
+String topicModeState()     { return topicBase() + "/mode/state"; }      // "auto" / "external"
+String topicModeSet()       { return topicBase() + "/mode/set"; }        // "auto" / "external"
+String topicAttr()          { return topicBase() + "/attributes"; }      // JSON телеметрия
 String topicIp()            { return topicBase() + "/ip"; }
 
-String discTopicBinary()    { return "homeassistant/binary_sensor/" + String(cfg.device_name) + "/tank/config"; }
-String discTopicRelay()     { return "homeassistant/switch/"        + String(cfg.device_name) + "/pump/config"; }
-String discTopicMode()      { return "homeassistant/select/"        + String(cfg.device_name) + "/mode/config"; }
-String discTopicIP()        { return "homeassistant/sensor/"        + String(cfg.device_name) + "/ip/config"; }
+// Discovery
+String discTopicLevel()     { return "homeassistant/sensor/"         + String(cfg.device_name) + "/level/config"; }
+String discTopicError()     { return "homeassistant/binary_sensor/"  + String(cfg.device_name) + "/error/config"; }
+String discTopicRelay()     { return "homeassistant/switch/"         + String(cfg.device_name) + "/pump/config"; }
+String discTopicMode()      { return "homeassistant/select/"         + String(cfg.device_name) + "/mode/config"; }
+String discTopicIP()        { return "homeassistant/sensor/"         + String(cfg.device_name) + "/ip/config"; }
 
 void addDeviceObject(JsonObject dev) {
   dev["ids"]  = String(cfg.device_name);
   dev["name"] = String(cfg.device_name);
   dev["mdl"]  = "NodeMCU-ESP8266";
   dev["mf"]   = "DIY";
-  dev["sw"]   = "3.0.0";
-  JsonArray conns = dev.createNestedArray("cns");  // HA: "connections"
+  dev["sw"]   = "3.2.0";
+  JsonArray conns = dev.createNestedArray("cns");
   JsonArray mac   = conns.createNestedArray();
   mac.add("mac"); mac.add(macStr());
 }
 
 void mqttSendDiscovery() {
-  // binary_sensor — «бак полный»
+  // sensor — уровень в процентах (0, 50, 100)
   {
     DynamicJsonDocument d(1024);
-    d["name"]        = String(cfg.device_name) + " Tank";
-    d["uniq_id"]     = String(cfg.device_name) + "-tank";
-    d["stat_t"]      = topicSensorState();
+    d["name"]        = String(cfg.device_name) + " Level";
+    d["uniq_id"]     = String(cfg.device_name) + "-level";
+    d["stat_t"]      = topicLevelState();
+    d["avty_t"]      = topicAvail();
+    d["unit_of_meas"]= "%";
+    d["icon"]        = "mdi:water-percent";
+    d["state_class"] = "measurement";
+    addDeviceObject(d.createNestedObject("dev"));
+    String payload; serializeJson(d, payload);
+    mqtt.publish(discTopicLevel().c_str(), payload.c_str(), true);
+  }
+  // binary_sensor — ошибка (невозможное состояние датчиков)
+  {
+    DynamicJsonDocument d(1024);
+    d["name"]        = String(cfg.device_name) + " Error";
+    d["uniq_id"]     = String(cfg.device_name) + "-error";
+    d["stat_t"]      = topicErrorState();
     d["avty_t"]      = topicAvail();
     d["pl_on"]       = "ON";
     d["pl_off"]      = "OFF";
-    d["icon"]        = "mdi:water-check";
-    // d["dev_cla"]   = "moisture"; // опционально
+    d["dev_cla"]     = "problem";
+    d["icon"]        = "mdi:alert-circle";
     addDeviceObject(d.createNestedObject("dev"));
     String payload; serializeJson(d, payload);
-    mqtt.publish(discTopicBinary().c_str(), payload.c_str(), true);
+    mqtt.publish(discTopicError().c_str(), payload.c_str(), true);
   }
   // switch — насос
   {
@@ -155,7 +174,7 @@ void mqttSendDiscovery() {
     d["stat_t"]      = topicModeState();
     d["cmd_t"]       = topicModeSet();
     d["avty_t"]      = topicAvail();
-    JsonArray opts = d.createNestedArray("ops"); // "options" (короткий ключ)
+    JsonArray opts = d.createNestedArray("ops"); // "options"
     opts.add("auto");
     opts.add("external");
     d["icon"]        = "mdi:automation";
@@ -178,27 +197,12 @@ void mqttSendDiscovery() {
   }
 }
 
-void mqttPublishAvailability() {
-  mqtt.publish(topicAvail().c_str(), "online", true);
-}
-
-void mqttPublishMode() {
-  const char* m = (cfg.mode == MODE_EXTERNAL) ? "external" : "auto";
-  mqtt.publish(topicModeState().c_str(), m, true);
-}
-
-void mqttPublishSensor(bool full) {
-  mqtt.publish(topicSensorState().c_str(), full ? "ON" : "OFF", true);
-}
-
-void mqttPublishRelay(bool on) {
-  mqtt.publish(topicRelayState().c_str(), on ? "ON" : "OFF", true);
-}
-
-void mqttPublishIpRetained() {
-  String ip = WiFi.localIP().toString();
-  mqtt.publish(topicIp().c_str(), ip.c_str(), true);
-}
+void mqttPublishAvailability() { mqtt.publish(topicAvail().c_str(), "online", true); }
+void mqttPublishMode()         { mqtt.publish(topicModeState().c_str(), (cfg.mode == MODE_EXTERNAL) ? "external" : "auto", true); }
+void mqttPublishLevel(int lvl) { String s = String(lvl); mqtt.publish(topicLevelState().c_str(), s.c_str(), true); }
+void mqttPublishError(bool e)  { mqtt.publish(topicErrorState().c_str(), e ? "ON" : "OFF", true); }
+void mqttPublishRelay(bool on) { mqtt.publish(topicRelayState().c_str(), on ? "ON" : "OFF", true); }
+void mqttPublishIpRetained()   { String ip = WiFi.localIP().toString(); mqtt.publish(topicIp().c_str(), ip.c_str(), true); }
 
 void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
   String t(topic);
@@ -208,11 +212,10 @@ void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
 
   if (t == topicRelaySet()) {
     bool want_on = (msg == "on" || msg == "1" || msg == "true");
-    // В EXTERNAL — просто применяем; в AUTO — применим, но алгоритм сразу может переиграть по датчику
+    // EXTERNAL — применяем напрямую; AUTO — автологика всё равно переиграет по 100%
     digitalWrite(PIN_RELAY, want_on ? HIGH : LOW);
     mqttPublishRelay(want_on);
-  }
-  else if (t == topicModeSet()) {
+  } else if (t == topicModeSet()) {
     if (msg == "external") cfg.mode = MODE_EXTERNAL;
     else                   cfg.mode = MODE_AUTO;
     saveConfig();
@@ -224,10 +227,8 @@ void mqttOnConnectedOnce() {
   mqttPublishAvailability();
   mqttSendDiscovery();
   mqttPublishMode();
-
   mqtt.subscribe(topicRelaySet().c_str());
   mqtt.subscribe(topicModeSet().c_str());
-
   mqttPublishIpRetained();
 }
 
@@ -253,11 +254,14 @@ void mqttPump() {
   if (ok) { mqtt_online = true; mqttOnConnectedOnce(); }
 }
 
-// =================== Веб-интерфейс (только статус) ===================
+// =================== Веб-интерфейс (статус) ===================
 ESP8266WebServer www(80);
 
-bool g_sensor_full = false;  // состояние датчика (true = полный)
-bool g_relay_on    = false;  // состояние реле
+int  g_level_percent = 0;   // 0 / 50 / 100
+bool g_error         = false;
+bool g_relay_on      = false;
+bool g_s50_on        = false;  // дебаунс-итог датчика 50%
+bool g_s100_on       = false;  // дебаунс-итог датчика 100%
 
 String htmlHeader(const char* title) {
   String s = F("<!doctype html><meta charset='utf-8'><meta name=viewport content='width=device-width,initial-scale=1'>");
@@ -269,7 +273,10 @@ String htmlHeader(const char* title) {
 void handleRoot() {
   String s = htmlHeader("Tank Controller");
   s += F("<h2>Tank Controller</h2>");
-  s += "<p>Sensor: <b>" + String(g_sensor_full ? "FULL (ON)" : "NOT FULL (OFF)") + "</b></p>";
+  s += "<p>Level: <b>" + String(g_level_percent) + "%</b></p>";
+  s += "<p>Error: <b>" + String(g_error ? "TRUE" : "FALSE") + "</b></p>";
+  s += "<p>Sensors: S50=" + String(g_s50_on ? "HIGH(ON)" : "LOW(OFF)")
+     +  ", S100=" + String(g_s100_on ? "HIGH(ON)" : "LOW(OFF)") + "</p>";
   s += "<p>Relay: <b>" + String(g_relay_on ? "ON" : "OFF") + "</b></p>";
   s += "<p>Mode: <b>" + String((cfg.mode==MODE_EXTERNAL) ? "external" : "auto") + "</b></p>";
   s += "<p>Wi-Fi IP: <b>" + WiFi.localIP().toString() + "</b>, RSSI " + String(WiFi.RSSI()) + " dBm</p>";
@@ -299,16 +306,64 @@ void factoryReset() {
   delay(300); ESP.restart();
 }
 
-// =================== Низкоуровневые функции управления ===================
+// =================== Датчики и реле ===================
+inline bool readRaw50()  { return digitalRead(PIN_SENSOR50)  == HIGH; } // >=50%
+inline bool readRaw100() { return digitalRead(PIN_SENSOR100) == HIGH; } // 100%
+
 void setRelay(bool on) {
   digitalWrite(PIN_RELAY, on ? HIGH : LOW);
   g_relay_on = on;
   if (mqtt_online) mqttPublishRelay(on);
 }
 
-bool readSensorRaw() {
-  // Сигнал с датчика: HIGH = бак ПОЛНЫЙ
-  return digitalRead(PIN_SENSOR) == LOW;
+// =================== LED поведение ===================
+// ВАЖНО: LED активен по LOW.
+// error=false:
+//   0%  -> OFF
+//   50% -> blink 1 Hz
+//   100%-> ON
+// error=true:
+//   not 100% -> blink 0.3 Hz
+//   100%     -> smooth breathing @ 5 Hz (PWM). Фолбэк: быстрый мигающий, если PWM недоступен.
+void driveLED(bool error, int level, uint32_t now_ms) {
+  // Проверим, сможем ли использовать PWM (GPIO16 не поддерживает)
+  bool pwm_possible = (LED_PIN != 16);
+
+  if (!error) {
+    if (level == 0) {
+      digitalWrite(LED_PIN, HIGH);                 // выкл
+    } else if (level == 50) {
+      bool onPhase = ((now_ms / 1000) % 2) == 0;   // 1 Гц
+      digitalWrite(LED_PIN, onPhase ? LOW : HIGH);
+    } else { // 100
+      digitalWrite(LED_PIN, LOW);                  // постоянно горит
+    }
+    return;
+  }
+
+  // error = true
+  if (level == 100) {
+    if (pwm_possible) {
+      // Плавное дыхание 5 Гц: яркость по синусу. Период = 1/5 c = 200 мс.
+      // Яркость 0..1023, инвертируем под активный LOW.
+      const float period_s = 0.2f; // 5 Гц
+      float t = fmodf(now_ms / 1000.0f, period_s) / period_s; // 0..1
+      float y = 0.5f * (1.0f - cosf(2.0f * 3.1415926f * t));  // 0..1
+      int duty = (int)(y * 1023.0f);                          // 0..1023
+      analogWrite(LED_PIN, 1023 - duty); // инвертируем
+    } else {
+      // Фолбэк — быстрое мигание 5 Гц
+      bool onPhase = ((now_ms / 100) % 2) == 0; // 5 Гц ~ 100 мс полупериод
+      digitalWrite(LED_PIN, onPhase ? LOW : HIGH);
+    }
+  } else {
+    // not 100%: мигаем 0.3 Гц (полный период ≈ 3.333c)
+    // 50% скважность
+    const uint32_t period_ms = 3333; // ~0.3 Гц
+    uint32_t phase = now_ms % period_ms;
+    bool onPhase = (phase < (period_ms / 2));
+    digitalWrite(LED_PIN, onPhase ? LOW : HIGH);
+  }
 }
 
 // =================== SETUP ===================
@@ -331,10 +386,11 @@ void setup() {
   Serial.begin(115200); delay(100);
   LittleFS.begin(); loadConfig();
 
-  // Пины датчика и реле
-  pinMode(PIN_SENSOR, INPUT_PULLUP); // датчик — вход (внешний источник уровня)
-  pinMode(PIN_RELAY,  OUTPUT);     // реле — выход
-  setRelay(false);                 // по умолчанию насос выкл
+  // Пины датчиков и реле
+  pinMode(PIN_SENSOR50,  INPUT_PULLUP);
+  pinMode(PIN_SENSOR100, INPUT_PULLUP);
+  pinMode(PIN_RELAY,     OUTPUT);
+  setRelay(false); // по умолчанию насос выкл
 
   // Wi-Fi
   WiFiManager wm;
@@ -352,7 +408,9 @@ void setup() {
   www.on("/reboot",     HTTP_GET, handleReboot);
   www.begin();
 
-  // MQTT сразу сформируем стартовые публикации (как только подключимся)
+  // (опционально) Частота PWM по умолчанию достаточна
+  // analogWriteRange(1023);
+  // analogWriteFreq(1000);
 }
 
 // =================== LOOP ===================
@@ -369,91 +427,96 @@ void loop() {
   if ((int32_t)(now - t_next) < 0) { delay(1); return; }
   t_next += cfg.sample_ms;
 
-  // Читаем датчик и антидребезг (N подряд)
-  bool raw = readSensorRaw();          // true = FULL
-  static bool     first_sample = true;
-  static bool     sensor_full  = false;
-  static uint8_t  cand_count   = 0;
-  static bool     cand_val     = false;
+  // Чтение с антидребезгом
+  bool raw50  = (digitalRead(PIN_SENSOR50)  == HIGH);  // сработал?
+  bool raw100 = (digitalRead(PIN_SENSOR100) == HIGH);  // сработал?
 
-  if (first_sample) {
-    sensor_full  = raw;
-    first_sample = false;
-    // Первый коннект к MQTT — опубликовать всё
+  static bool first = true;
+  static bool s50_on = false, s100_on = false;
+  static uint8_t c50 = 0, c100 = 0;
+  static bool cand50 = false, cand100 = false;
+
+  if (first) {
+    s50_on  = raw50;
+    s100_on = raw100;
+    first = false;
     if (mqtt_online) {
       mqttPublishAvailability();
       mqttSendDiscovery();
       mqttPublishMode();
       mqttPublishIpRetained();
-      mqttPublishSensor(sensor_full);
+      int lvl = s100_on ? 100 : (s50_on ? 50 : 0);
+      bool err = (!s50_on && s100_on);
+      mqttPublishLevel(lvl);
+      mqttPublishError(err);
       mqttPublishRelay(g_relay_on);
     }
   } else {
-    if (raw != sensor_full) {
-      if (cand_count == 0) cand_val = raw;
-      if (raw == cand_val) {
-        cand_count++;
-        if (cand_count >= cfg.confirm_samples) {
-          sensor_full = raw;
-          cand_count = 0;
-        }
-      } else {
-        cand_val = raw;
-        cand_count = 1;
-      }
-    } else {
-      cand_count = 0;
-    }
+    if (raw50 != s50_on) {
+      if (c50 == 0) cand50 = raw50;
+      if (raw50 == cand50) {
+        if (++c50 >= cfg.confirm_samples) { s50_on = raw50; c50 = 0; }
+      } else { cand50 = raw50; c50 = 1; }
+    } else c50 = 0;
+
+    if (raw100 != s100_on) {
+      if (c100 == 0) cand100 = raw100;
+      if (raw100 == cand100) {
+        if (++c100 >= cfg.confirm_samples) { s100_on = raw100; c100 = 0; }
+      } else { cand100 = raw100; c100 = 1; }
+    } else c100 = 0;
   }
 
-  // LED: FULL => горит (LOW включает)
-  digitalWrite(LED_PIN, sensor_full ? LOW : HIGH);
-  g_sensor_full = sensor_full;
+  // Строго дискретные уровни
+  int  level = s100_on ? 100 : (s50_on ? 50 : 0);
+  bool error = (!s50_on && s100_on); // невозможно: 100% без 50%
 
-  // Управление насосом по режиму
+  // Обновления для веба
+  g_s50_on        = s50_on;
+  g_s100_on       = s100_on;
+  g_level_percent = level;
+  g_error         = error;
+
+  // Светодиод согласно ТЗ
+  driveLED(error, level, now);
+
+  // Управление насосом (только датчик 100%)
   if (cfg.mode == MODE_AUTO) {
-    // Автологика:
-    // - если бак ПОЛНЫЙ => насос ВЫКЛ
-    // - если НЕ ПОЛНЫЙ => насос ВКЛ
-    bool want_on = !sensor_full;
+    bool want_on = !s100_on; // 100% не достигнут — насос включён
     if (want_on != g_relay_on) setRelay(want_on);
-  } else {
-    // EXTERNAL: ничего не делаем, состояние реле задаёт внешний MQTT /relay/set
-    // (без автопереигрывания по датчику)
   }
 
-  // Публикации MQTT при изменениях
+  // MQTT публикации на изменения
   if (mqtt_online) {
-    static bool last_pub_sensor = !sensor_full;
-    if (sensor_full != last_pub_sensor) {
-      mqttPublishSensor(sensor_full);
-      last_pub_sensor = sensor_full;
-    }
-
+    static int  last_level = -1;
+    static bool last_error = !error;
     static bool last_pub_relay = !g_relay_on;
-    if (g_relay_on != last_pub_relay) {
-      mqttPublishRelay(g_relay_on);
-      last_pub_relay = g_relay_on;
-    }
+
+    if (level != last_level) { mqttPublishLevel(level); last_level = level; }
+    if (error != last_error) { mqttPublishError(error);  last_error = error; }
+    if (g_relay_on != last_pub_relay) { mqttPublishRelay(g_relay_on); last_pub_relay = g_relay_on; }
 
     // IP при смене
     static String last_ip;
     String cur_ip = WiFi.localIP().toString();
     if (cur_ip != last_ip) { last_ip = cur_ip; mqttPublishIpRetained(); }
 
-    // Доп. телеметрия
+    // Атрибуты
     StaticJsonDocument<256> attr;
     attr["sample_ms"]       = cfg.sample_ms;
     attr["confirm_needed"]  = cfg.confirm_samples;
     attr["mode"]            = (cfg.mode == MODE_EXTERNAL) ? "external" : "auto";
     attr["uptime_s"]        = (uint32_t)(millis()/1000);
     attr["rssi"]            = WiFi.RSSI();
+    attr["s50"]             = s50_on;
+    attr["s100"]            = s100_on;
+    attr["error"]           = error;
     String payload; serializeJson(attr, payload);
     mqtt.publish(topicAttr().c_str(), payload.c_str(), false);
   }
 
   // Лог
-  Serial.printf("sensor_raw=%d full=%d relay=%d mode=%s\n",
-                (int)raw, (int)sensor_full, (int)g_relay_on,
+  Serial.printf("s50=%d s100=%d level=%d error=%d relay=%d mode=%s\n",
+                (int)s50_on, (int)s100_on, level, (int)error, (int)g_relay_on,
                 (cfg.mode==MODE_EXTERNAL) ? "EXTERNAL" : "AUTO");
 }
