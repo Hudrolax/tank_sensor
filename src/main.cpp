@@ -97,6 +97,35 @@ void loop() {
     if (mqtt_online()) mqtt_publish_diff();
   }
 
+  // Проверка режима точки доступа: если не подключены к WiFi (AP режим), перезагружаемся через 5 минут
+  static uint32_t ap_mode_start = 0;
+  const uint32_t AP_REBOOT_INTERVAL_MS = 5 * 60 * 1000; // 5 минут
+  
+  // Проверяем, находимся ли мы в режиме AP (не подключены к WiFi как станция)
+  // Если нет локального IP (0.0.0.0), значит мы не подключены как станция
+  bool is_ap_mode = (WiFi.localIP() == IPAddress(0, 0, 0, 0));
+  
+  if (is_ap_mode) {
+    // Если только что вошли в AP режим, запоминаем время
+    if (ap_mode_start == 0) {
+      ap_mode_start = now;
+      Serial.println("AP mode detected, will reboot in 5 minutes if still in AP mode");
+    }
+    
+    // Проверяем, прошло ли 5 минут
+    if ((int32_t)(now - ap_mode_start) >= (int32_t)AP_REBOOT_INTERVAL_MS) {
+      Serial.println("AP mode timeout (5 min), rebooting...");
+      delay(500);
+      ESP.restart();
+    }
+  } else {
+    // Если подключились к WiFi, сбрасываем таймер
+    if (ap_mode_start != 0) {
+      ap_mode_start = 0;
+      Serial.println("Connected to WiFi, AP mode timer reset");
+    }
+  }
+
   // Отладочный лог — раз в секунду
   static uint32_t t_log = 0;
   if ((int32_t)(now - t_log) >= 1000) {
